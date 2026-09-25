@@ -643,18 +643,42 @@ function sendTo(pid,msg){
 
 function peerOpts(){ return { debug:1 }; }
 
+/* Só uma aba pode ser anfitriã de uma sala: a mais nova assume e a antiga se desliga. */
+const HOST_BC = (()=>{ try{ return new BroadcastChannel("cifra-host"); }catch(e){ return null; } })();
+if(HOST_BC) HOST_BC.onmessage = ev=>{
+  const m=ev.data||{};
+  if(m.t==="takeover" && ROLE==="host" && G && m.code===G.code && m.tab!==TAB_ID){
+    try{ HOST.peer&&HOST.peer.destroy(); }catch(e){}
+    HOST.conns.clear(); ROLE=null; VIEW=null; G=null; NET_MSG="";
+    toast("A sala foi reaberta em outra aba. Esta aba foi desligada."); render();
+  }
+};
+const TAB_ID = rid(8);
+
 function hostRoom(existing, name){
   ROLE="host"; NET_OK=false; NET_MSG="Abrindo a sala…"; render();
   const pid=myPid();
   let code = existing ? existing.code : rid(5);
   if(existing){ G=existing; Object.values(G.players).forEach(p=>p.online=false); remapPid(G.hostPid,pid); G.hostPid=pid; G.players[pid]=G.players[pid]||{name,team:null,joined:Date.now()}; G.players[pid].online=true; G.players[pid].name=name; }
   else G=newState(code, pid, name);
-  let tries=0;
+  if(existing && HOST_BC) HOST_BC.postMessage({t:"takeover", code, tab:TAB_ID});
+  let tries=0, everOpen=false, keepT=null;
   setTimeout(()=>{ if(ROLE==="host" && !NET_OK && !VIEW){ NET_MSG="Não consegui falar com o servidor de salas. Se você abriu o jogo dentro de uma pré-visualização (como a do Claude), ela bloqueia conexões externas: publique o arquivo num site (Netlify, GitHub Pages) ou abra-o direto no navegador."; render(); } }, 12000);
   const open=()=>{
+    if(ROLE!=="host") return;
     const peer=new Peer(PREFIX+code, peerOpts());
     HOST.peer=peer;
-    peer.on("open", ()=>{ NET_OK=true; NET_MSG=""; location.hash=code; commit(); });
+    const mine=()=>ROLE==="host" && HOST.peer===peer && !peer.destroyed;
+    // enquanto estiver sem o servidor de salas, tenta voltar a cada 3 s (as conexões já abertas continuam)
+    const keepAlive=()=>{
+      if(keepT) return;
+      keepT=setInterval(()=>{
+        if(!mine()){ clearInterval(keepT); keepT=null; return; }
+        if(peer.disconnected){ try{ peer.reconnect(); }catch(e){} }
+        else { clearInterval(keepT); keepT=null; }
+      }, 3000);
+    };
+    peer.on("open", ()=>{ if(!mine()) return; everOpen=true; tries=0; NET_OK=true; NET_MSG=""; location.hash=code; commit(); });
     peer.on("connection", conn=>{
       let pidC=null;
       conn.on("data", msg=>{
@@ -662,7 +686,12 @@ function hostRoom(existing, name){
         if(msg.t==="hello"){
           const p=String(msg.pid||"").slice(0,24), nm=String(msg.name||"").trim().slice(0,20)||"Agente";
           if(!/^p[A-Z]{10}$/.test(p) || p===G.hostPid){ conn.send({t:"toast",msg:"Não foi possível entrar."}); return; }
-          const old=HOST.conns.get(p); if(old&&old!==conn){ try{old.close();}catch(e){} }
+          const old=HOST.conns.get(p);
+          if(old&&old!==conn){
+            // mesma pessoa numa conexão nova: avisa a antiga (útil se for outra aba) e fecha
+            try{ old.send({t:"replaced"}); }catch(e){}
+            setTimeout(()=>{ try{ old.close(); }catch(e){} }, 300);
+          }
           pidC=p; HOST.conns.set(p,conn);
           if(!G.players[p] && G.phase!=="lobby"){
             // quem fechou a aba e voltou com o mesmo codinome recupera o lugar
@@ -675,20 +704,24 @@ function hostRoom(existing, name){
           } else { G.players[p].online=true; G.players[p].name=nm; }
           commit(); return;
         }
-        if(pidC) act(pidC, msg);
+        if(pidC && HOST.conns.get(pidC)===conn) act(pidC, msg);
       });
-      conn.on("close", ()=>{ if(pidC && HOST.conns.get(pidC)===conn){ HOST.conns.delete(pidC); if(G.players[pidC]){ G.players[pidC].online=false; commit(); } } });
+      conn.on("close", ()=>{ if(G && pidC && HOST.conns.get(pidC)===conn){ HOST.conns.delete(pidC); if(G.players[pidC]){ G.players[pidC].online=false; commit(); } } });
       conn.on("error", ()=>{});
     });
-    peer.on("disconnected", ()=>{ NET_OK=false; NET_MSG="Reconectando ao servidor…"; render(); setTimeout(()=>{ try{ peer.reconnect(); }catch(e){} },1500); });
+    peer.on("disconnected", ()=>{ if(!mine()) return; NET_OK=false; NET_MSG="Reconectando ao servidor de salas…"; render(); keepAlive(); });
     peer.on("error", err=>{
+      if(HOST.peer!==peer || ROLE!=="host") return;
       if(err.type==="unavailable-id"){
-        try{ peer.destroy(); }catch(e){}
-        if(existing){ if(++tries<16){ NET_MSG="Recuperando a sala "+code+"… (tentativa "+tries+")"; render(); setTimeout(open,5000); } else { NET_MSG="Não consegui reabrir a sala. Crie uma nova."; render(); } }
-        else { code=rid(5); G.code=code; open(); }
+        if(!everOpen && !existing){ try{ peer.destroy(); }catch(e){} code=rid(5); G.code=code; open(); return; }  // código novo que colidiu: sorteia outro
+        // a sala é nossa, mas o servidor ainda guarda a conexão antiga: tenta de novo com o mesmo código
+        if(peer.destroyed){
+          if(++tries<=40){ NET_MSG="Recuperando a sala "+code+"… (tentativa "+tries+")"; render(); setTimeout(open,3000); }
+          else { NET_MSG="Não consegui reabrir a sala. Crie uma nova."; render(); }
+        } else keepAlive();
         return;
       }
-      if(err.type==="network"||err.type==="server-error"||err.type==="socket-error"){ NET_OK=false; NET_MSG="Sem conexão com o servidor de salas. Tentando de novo…"; render(); return; }
+      if(err.type==="network"||err.type==="server-error"||err.type==="socket-error"){ NET_OK=false; NET_MSG="Sem conexão com o servidor de salas. Tentando de novo…"; render(); keepAlive(); return; }
       if(err.type==="browser-incompatible"){ NET_MSG="Este navegador não suporta conexões diretas. Use Chrome, Firefox, Edge ou Safari atualizados."; render(); return; }
       console.warn(err);
     });
@@ -699,36 +732,67 @@ function hostRoom(existing, name){
 function joinRoom(code, name){
   ROLE="client"; CLIENT.code=code; NET_OK=false; NET_MSG="Procurando a sala "+code+"…"; render();
   lsSet("cifra:name", name); lsSet("cifra:lastJoin", code);
+  clearTimeout(CLIENT.timer); CLIENT.timer=null; CLIENT.retry=0; CLIENT.conn=null;
   const peer=new Peer(peerOpts());
   CLIENT.peer=peer;
+  const live=()=>ROLE==="client" && CLIENT.peer===peer && !peer.destroyed;
+  const connected=()=>!!(CLIENT.conn && CLIENT.conn.open);
+  let attempt=0, waitingOpen=false;
   setTimeout(()=>{ if(ROLE==="client" && !peer.open && !VIEW){ NET_MSG="Não consegui falar com o servidor de salas. Se você abriu o jogo dentro de uma pré-visualização (como a do Claude), ela bloqueia conexões externas: publique o arquivo num site (Netlify, GitHub Pages) ou abra-o direto no navegador."; render(); } }, 12000);
+
   peer.on("error", err=>{
-    if(err.type==="peer-unavailable"){ if(VIEW) retry(); else fail("Não encontrei a sala "+code+". Confira o código com o anfitrião."); }
-    else if(err.type==="network"||err.type==="server-error"||err.type==="socket-error"){ NET_OK=false; retry(); }
+    if(!live()) return;
+    if(err.type==="peer-unavailable"){
+      if(connected()) return;                       // erro atrasado de uma tentativa antiga: ignora
+      if(VIEW) retry(); else fail("Não encontrei a sala "+code+". Confira o código com o anfitrião.");
+    }
+    else if(err.type==="network"||err.type==="server-error"||err.type==="socket-error"){ if(!connected()){ NET_OK=false; retry(); } }
     else if(err.type==="browser-incompatible"){ fail("Este navegador não suporta conexões diretas. Use Chrome, Firefox, Edge ou Safari atualizados."); }
   });
-  peer.on("disconnected", ()=>{ setTimeout(()=>{ try{ if(!peer.destroyed) peer.reconnect(); }catch(e){} },1500); });
+  peer.on("disconnected", ()=>{ setTimeout(()=>{ if(live() && peer.disconnected){ try{ peer.reconnect(); }catch(e){} } }, 2000); });
+  peer.on("open", ()=>{ if(waitingOpen && live()){ waitingOpen=false; go(); } });
+
+  // uma tentativa de conexão; tudo que vier de tentativas antigas é ignorado
+  const go=()=>{
+    if(!live() || connected()) return;
+    const my=++attempt;
+    try{ if(CLIENT.conn) CLIENT.conn.close(); }catch(e){}
+    const conn=peer.connect(PREFIX+code, {reliable:true, serialization:"json"});
+    CLIENT.conn=conn;
+    const to=setTimeout(()=>{
+      if(my!==attempt || conn.open || !live()) return;
+      try{ conn.close(); }catch(e){}
+      if(VIEW) retry(); else fail("A sala "+code+" não respondeu. Confira o código e se o anfitrião está com a página aberta.");
+    }, 12000);
+    conn.on("open", ()=>{
+      clearTimeout(to);
+      if(my!==attempt || !live()){ try{ conn.close(); }catch(e){} return; }
+      CLIENT.retry=0; NET_OK=true; NET_MSG=""; location.hash=code;
+      conn.send({t:"hello", pid:myPid(), name}); render();
+    });
+    conn.on("data", msg=>{
+      if(my!==attempt || !live()) return;
+      if(msg && msg.t==="replaced"){ fail("Você entrou nesta sala por outra aba ou dispositivo, então esta aba foi desconectada."); return; }
+      handleMsg(msg);
+    });
+    conn.on("close", ()=>{ clearTimeout(to); if(my!==attempt || !live()) return; NET_OK=false; retry(); });
+    conn.on("error", ()=>{});
+  };
   const connect=()=>{
-    if(ROLE!=="client"||peer.destroyed) return;
-    const go=()=>{
-      try{ if(CLIENT.conn) CLIENT.conn.close(); }catch(e){}
-      const conn=peer.connect(PREFIX+code, {reliable:true, serialization:"json"});
-      CLIENT.conn=conn;
-      const to=setTimeout(()=>{ if(!conn.open){ try{conn.close();}catch(e){} if(VIEW) retry(); else fail("A sala "+code+" não respondeu. Confira o código e se o anfitrião está com a página aberta."); } },12000);
-      conn.on("open", ()=>{ clearTimeout(to); CLIENT.retry=0; NET_OK=true; NET_MSG=""; location.hash=code; conn.send({t:"hello", pid:myPid(), name}); render(); });
-      conn.on("data", handleMsg);
-      conn.on("close", ()=>{ clearTimeout(to); if(ROLE!=="client"||CLIENT.conn!==conn) return; NET_OK=false; retry(); });
-      conn.on("error", ()=>{});
-    };
-    if(peer.open) go(); else peer.once("open", go);
+    if(!live() || connected()) return;
+    if(peer.open) go();
+    else { waitingOpen=true; if(peer.disconnected){ try{ peer.reconnect(); }catch(e){} } }
   };
+  // uma única nova tentativa agendada por vez, com espera crescente
   const retry=()=>{
-    clearTimeout(CLIENT.timer);
-    if(++CLIENT.retry>20){ fail("Perdi a conexão com o anfitrião."); return; }
+    if(!live() || CLIENT.timer) return;
+    CLIENT.retry++;
+    if(CLIENT.retry>60){ fail("Perdi a conexão com o anfitrião."); return; }
     NET_MSG="Conexão perdida. Tentando voltar à sala… ("+CLIENT.retry+")"; render();
-    CLIENT.timer=setTimeout(connect, 2500);
+    const wait=Math.min(8000, 1500+CLIENT.retry*500);
+    CLIENT.timer=setTimeout(()=>{ CLIENT.timer=null; connect(); }, wait);
   };
-  const fail=msg=>{ clearTimeout(CLIENT.timer); try{ CLIENT.peer&&CLIENT.peer.destroy(); }catch(e){} CLIENT.peer=null; ROLE=null; VIEW=null; NET_MSG=""; toast(msg); render(); };
+  const fail=msg=>{ clearTimeout(CLIENT.timer); CLIENT.timer=null; try{ peer.destroy(); }catch(e){} CLIENT.peer=null; CLIENT.conn=null; ROLE=null; VIEW=null; NET_MSG=""; toast(msg); render(); };
   connect();
 }
 
@@ -785,7 +849,7 @@ function landingView(){
   const name=lsGet("cifra:name")||"";
   const hashCode=(location.hash||"").replace("#","").toUpperCase();
   let saved=null; try{ saved=JSON.parse(lsGet("cifra:host")||"null"); }catch(e){}
-  const canResume = saved && saved.G && Date.now()-saved.at < 12*3600*1000 && saved.G.hostPid===myPid();
+  const canResume = saved && saved.G && Date.now()-saved.at < 12*3600*1000 && saved.G.phase!=="end";
   return `
   <div class="landing">
     <section>
@@ -1107,7 +1171,7 @@ document.addEventListener("click", e=>{
     case "quit": {
       if(ROLE==="host" && VIEW && VIEW.phase!=="lobby" && !confirm("Você é o anfitrião. Se sair, a partida para para todo mundo. Sair mesmo?")) return;
       try{ HOST.peer&&HOST.peer.destroy(); }catch(err){} try{ CLIENT.peer&&CLIENT.peer.destroy(); }catch(err){}
-      clearTimeout(CLIENT.timer); HOST.conns.clear(); ROLE=null; VIEW=null; G=null; NET_MSG=""; history.replaceState(null,"",location.pathname+location.search); render(); break;
+      clearTimeout(CLIENT.timer); CLIENT.timer=null; HOST.conns.clear(); ROLE=null; VIEW=null; G=null; NET_MSG=""; history.replaceState(null,"",location.pathname+location.search); render(); break;
     }
     case "copy": {
       const url=location.origin+location.pathname+"#"+VIEW.code;
