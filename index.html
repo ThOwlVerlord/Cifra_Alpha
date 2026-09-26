@@ -268,12 +268,17 @@ td.term{font-family:var(--term);font-size:1.25rem;white-space:nowrap}
 .stamp.good{color:#138a52}
 .rcard.B .stamp.good{color:var(--green)}
 .stamp.badst{color:var(--red)}
+.verdict{margin-top:14px;border:3px solid var(--ink);border-radius:10px;padding:8px 10px;display:flex;flex-direction:column;gap:3px;font-size:.85rem}
+.verdict b{font-family:var(--head);font-weight:400;font-size:.82rem;line-height:1.3}
+.verdict.win{background:var(--green);color:var(--ink)}
+.verdict.lose{background:var(--red);color:#fff}
 .winner{font-family:var(--head);font-size:clamp(1.8rem,6vw,3.4rem);line-height:1;text-shadow:-.05em 0 var(--red), .05em 0 var(--cyan)}
-@media (prefers-reduced-motion:no-preference){ .winner{animation:zoom .6s cubic-bezier(.2,1.6,.4,1) both} @keyframes zoom{from{transform:scale(.3);opacity:0}to{transform:none;opacity:1}} }
+@media (prefers-reduced-motion:no-preference){ .winner.zoom{animation:zoom .6s cubic-bezier(.2,1.6,.4,1) both} @keyframes zoom{from{transform:scale(.3);opacity:0}to{transform:none;opacity:1}} }
 
 .toast{position:fixed;left:50%;transform:translateX(-50%);bottom:calc(18px + env(safe-area-inset-bottom,0px));background:var(--yellow);color:var(--ink);border:3px solid var(--ink);box-shadow:4px 4px 0 var(--ink);padding:10px 16px;border-radius:12px;max-width:min(92vw,520px);font-weight:700;z-index:60;display:none}
 .toast.show{display:block}
 .banner{background:var(--red);color:#fff;border:3px solid var(--ink);border-radius:12px;padding:10px 14px;margin-bottom:14px;font-weight:700}
+.btn .spin{border-color:currentColor;border-right-color:transparent;width:13px;height:13px;border-width:2px;vertical-align:-1px;margin-right:4px}
 .spin{display:inline-block;width:16px;height:16px;border:3px solid var(--cyan);border-right-color:transparent;border-radius:50%;animation:spin .8s linear infinite;vertical-align:-3px}
 @keyframes spin{to{transform:rotate(360deg)}}
 @media (prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}}
@@ -486,6 +491,7 @@ function act(pid, m){
       if(!Array.isArray(m.clues)||m.clues.length!==3) return;
       const clues=m.clues.map(c=>String(c||"").trim().slice(0,60));
       if(clues.some(c=>!c)) return;
+      if(!sameCode(m.code, x.code)) return sendTo(pid,{t:"toast", msg:"Seu código mudou antes do envio. Confira as dicas para o código novo e transmita de novo."});
       x.clues=clues;
       const all=transmitters().every(tt=>r.teams[tt].clues);
       if(all){ G.phase="guess"; G.timerEnd=null;  }
@@ -511,7 +517,6 @@ function act(pid, m){
       const target = kind==="dec" ? t : other(t);
       r.teams[target][kind] = { g:d.slice(), by:pid }; 
       checkGuessDone();
-      if(G.phase==="reveal") 
       break;
     }
     case "next": {
@@ -553,6 +558,7 @@ function act(pid, m){
       if(!isHost || G.phase!=="clues" || !r) return;
       const t=m.team; const x=r.teams[t]; if(!x||x.clues) return;
       const next=nextEncryptor(t, x.enc); if(!next) return sendTo(pid,{t:"toast", msg:"Não há outro jogador conectado nessa equipe."});
+      x.swaps=(x.swaps||[]).concat([{from:x.enc, to:next, code:x.code.slice()}]);
       x.enc=next;
       x.seen=(x.seen||[]).concat([x.code.join("")]);   // códigos já vistos nesta rodada
       let c; do{ c=newCode(); }while(x.seen.includes(c.join("")) && x.seen.length<24);
@@ -592,7 +598,7 @@ function viewFor(pid){
     const complete = r.n<G.round || (r.n===G.round && done);
     if(!complete) return;
     const teams={};
-    Object.keys(r.teams).forEach(t=>{ const x=r.teams[t]; teams[t]={enc:x.enc, code:x.code, clues:x.clues, int:x.int?x.int.g:null, dec:x.dec?x.dec.g:null, intOk:x.intOk, decOk:x.decOk}; });
+    Object.keys(r.teams).forEach(t=>{ const x=r.teams[t]; teams[t]={enc:x.enc, code:x.code, swaps:x.swaps||[], clues:x.clues, int:x.int?x.int.g:null, dec:x.dec?x.dec.g:null, intOk:x.intOk, decOk:x.decOk}; });
     history.push({n:r.n, teams});
   });
   let current=null;
@@ -819,13 +825,41 @@ function setView(v){
     if(a!==b) UI.popTokens=true;
   }
   if(!prev || prev.round!==v.round || prev.phase!==v.phase || prev.gameNo!==v.gameNo){ UI.animKey=Math.random(); }
+  Object.keys(UI.pend).forEach(k=>{ if(pendDone(k, v)) delete UI.pend[k]; });
   render();
 }
 
 /* =================================================================
    Interface
    ================================================================= */
-const UI = { noteDraft:{}, labUnlocked: lsGet("cifra:lab")==="1", tab:null, clueDraft:{key:null, v:["","",""]}, tbDraft:["","","",""], cover:false, popTokens:false, animKey:0, customOpen:false };
+const UI = { played:new Set(), pend:{}, local:{}, noteDraft:{}, labUnlocked: lsGet("cifra:lab")==="1", tab:null, clueDraft:{key:null, v:["","",""]}, tbDraft:["","","",""], cover:false, popTokens:false, animKey:0, customOpen:false };
+
+/* Resposta imediata aos cliques: mostra a escolha/envio na hora e depois confere com o anfitrião. */
+function pk(k){ return VIEW ? VIEW.gameNo+"-"+VIEW.round+"-"+k : ""; }
+function isPend(k){ const p=UI.pend[k]; return !!(p && p.key===pk(k) && Date.now()-p.at<7000); }
+function pendDone(k, v){
+  if(!v) return true;
+  if(k==="tb") return v.phase!=="tiebreak" || !!(v.tb && v.tb.mine);
+  const c=v.current, t=v.myTeam;
+  if(!c || !t) return true;
+  if(k==="clues") return v.phase!=="clues" || !c.teams[t] || c.teams[t].hasClues;
+  if(k==="dec") return v.phase!=="guess" || !c.teams[t] || c.teams[t].hasDec;
+  if(k==="int"){ const o=c.teams[other(t)]; return v.phase!=="guess" || !o || o.hasInt; }
+  return true;
+}
+function markPend(k, failMsg){
+  const p={key:pk(k), at:Date.now()}; UI.pend[k]=p; render();
+  setTimeout(()=>{
+    if(UI.pend[k]!==p) return;                 // já confirmado (ou substituído)
+    delete UI.pend[k];
+    if(ROLE && !pendDone(k, VIEW)){ toast(failMsg); render(); }
+  }, 7100);
+}
+function dispDraft(k){
+  const l=UI.local[k];
+  if(l && l.key===pk(k) && Date.now()<l.until) return l.arr;
+  return (VIEW && VIEW.drafts && VIEW.drafts[k]) || [null,null,null];
+}
 
 function nameOf(pid){ const p=VIEW&&VIEW.players.find(x=>x.pid===pid); return p?p.name:"?"; }
 function soloTx(){ const n=VIEW&&VIEW.members&&VIEW.members.W?VIEW.members.W.length:2; return n===2?{a:"a dupla",A:"A dupla",da:"da dupla",N:"Dupla"}:{a:"a equipe",A:"A equipe",da:"da equipe",N:"Equipe"}; }
@@ -896,7 +930,7 @@ function topBar(){
   const rn = v.phase!=="lobby" && v.round ? `<div class="roundno">Rodada <span>${v.round}</span>/${v.maxRounds}</div>` : "";
   return `<div class="topbar">
     <div class="row"><div class="logo sm">CIFRA</div><span class="chip"><span class="led ${NET_OK?"":"off"}"></span>Sala <b>${esc(v.code)}</b></span>${ROLE==="lab"?`<span class="chip" style="color:var(--yellow)">Modo de teste</span>`:`<button class="btn sm cream" data-a="copy">Copiar convite</button>`}</div>
-    <div class="row">${rn}${scoreBoard()}<button class="iconbtn" data-a="quit" aria-label="Sair da sala" title="Sair da sala">⏏</button></div>
+    <div class="row">${rn}${scoreBoard()}<button class="btn sm coal" data-a="quit">Sair da sala</button></div>
   </div>`;
 }
 
@@ -915,7 +949,7 @@ function startLab(n){
 function labSwitch(pid){ if(!G.players[pid]) return; LAB.active=pid; UI.noteDraft={}; UI.tab=null; UI.tbDraft=["","","",""]; UI.cover=false; commit(); }
 function labClues(){
   const r=curRound(); if(!r||G.phase!=="clues") return;
-  transmitters().forEach(t=>{ const x=r.teams[t]; if(!x.clues) act(x.enc,{t:"clues", clues:x.code.map(d=>"pista "+d+" (r"+r.n+")")}); });
+  transmitters().forEach(t=>{ const x=r.teams[t]; if(!x.clues) act(x.enc,{t:"clues", code:x.code.slice(), clues:x.code.map(d=>"pista "+d+" (r"+r.n+")")}); });
 }
 function labGuess(target, kind, right){
   const r=curRound(); if(!r||G.phase!=="guess") return;
@@ -1011,6 +1045,8 @@ function myScreen(){
   const mates=v.members[t].map(nameOf).join(", ");
   return `<div class="screen ${t} ${UI.cover?"covered":""}"><div class="title"><h3>${esc(teamName(t))}</h3><button class="btn sm ${t==="W"?"coal":"cream"}" data-a="cover">${UI.cover?"Mostrar":"Esconder"}</button></div>${monitors(v.myWords,t,true)}<p class="small" style="margin:10px 0 0;opacity:.75">${esc(mates)}</p></div>`;
 }
+// devolve a classe de animação só na primeira vez que aquele elemento aparece
+function once(id, cls){ if(UI.played.has(id)) return ""; UI.played.add(id); return cls; }
 function floppy(t, code, caption, cls){
   return `<div class="floppy ${t} ${cls||""}"><div class="shutter"></div><div class="label"><span class="cap">${esc(caption)}</span><span class="digits">${code.join("")}</span></div></div>`;
 }
@@ -1023,13 +1059,17 @@ function actionArea(){
   if(v.phase==="clues"){
     const x = t && cur.teams[t];
     if(x && x.enc===me && !x.hasClues && x.code){
-      const key=v.gameNo+"-"+cur.n+"-"+v.me;
-      if(UI.clueDraft.key!==key) UI.clueDraft={key, v:["","",""]};
+      const base=v.gameNo+"-"+cur.n+"-"+v.me, key=base+"-"+x.code.join("");
+      if(UI.clueDraft.key!==key){
+        const hadText = UI.clueDraft.base===base && UI.clueDraft.v.some(z=>z.trim());
+        UI.clueDraft={key, base, v:["","",""], changed: UI.clueDraft.base===base};
+        if(hadText) toast("Seu código mudou! As dicas anteriores foram apagadas.");
+      }
       const words=v.myWords||[];
       out.push(`<div class="panel stack clueform"><span class="tasklabel enc">Você é o codificador</span>
-        <div class="row" style="align-items:flex-start;flex-wrap:nowrap;gap:16px">${floppy(t,x.code,"CÓDIGO SECRETO","secret insert")}<p class="small" style="margin:0">Escreva uma dica para cada número, nesta ordem. Seus colegas precisam entender; os adversários, não.</p></div>
-        ${x.code.map((d,i)=>`<div class="line"><span class="numtag">${d}<small>${esc(words[d-1]||"")}</small></span><input type="text" id="clue${i}" maxlength="60" autocomplete="off" placeholder="Dica para o ${d}" value="${esc(UI.clueDraft.v[i])}"></div>`).join("")}
-        <button class="btn red big" data-a="sendClues">Transmitir</button></div>`);
+        <div class="row" style="align-items:flex-start;flex-wrap:nowrap;gap:16px">${floppy(t,x.code,"CÓDIGO SECRETO","secret "+once("ins-"+v.gameNo+"-"+cur.n+"-"+v.me+"-"+x.code.join(""),"insert"))}<p class="small" style="margin:0">${UI.clueDraft.changed?`<b style="color:var(--red)">Código novo!</b> O codificador foi trocado nesta rodada e este é um código diferente do anterior. `:""}Escreva uma dica para cada número, nesta ordem. Seus colegas precisam entender; os adversários, não.</p></div>
+        ${x.code.map((d,i)=>`<div class="line"><span class="numtag">${d}<small>${esc(words[d-1]||"")}</small></span><input type="text" id="clue${i}" maxlength="60" autocomplete="off" placeholder="Dica para o ${d}" value="${esc(UI.clueDraft.v[i])}" ${isPend("clues")?"readonly":""}></div>`).join("")}
+        <button class="btn red big" data-a="sendClues" ${isPend("clues")?"disabled":""}>${isPend("clues")?`<span class="spin"></span> Transmitindo…`:"Transmitir"}</button></div>`);
     }
     const lines=Object.keys(cur.teams).map(tt=>{ const y=cur.teams[tt]; return statusLine(y.hasClues, y.hasClues?`${esc(nameOf(y.enc))} (${esc(teamName(tt))}) já transmitiu.`:`${esc(nameOf(y.enc))} (${esc(teamName(tt))}) está escrevendo as dicas…${amHost()&&v.members[tt]&&v.members[tt].length>1?` <button class="linkbtn" data-a="skipEnc" data-t="${tt}">trocar codificador</button>`:""}`); });
     out.push(`<div class="stack">${lines.join("")}</div>`);
@@ -1038,14 +1078,13 @@ function actionArea(){
   }
   if(v.phase==="guess"){
     const tasks=[];
-    const dr=v.drafts||{dec:[],int:[]};
     const pad=(kind, target)=>{
       const clues=cur.teams[target].clues;
       const label = kind==="dec" ? `<span class="tasklabel dec">Decifre o código da sua equipe</span>` : `<span class="tasklabel int">Intercepte ${v.mode==="3p"?"o código "+soloTx().da:"o código adversário"}</span>`;
-      const d=dr[kind]||[null,null,null];
+      const d=dispDraft(kind), sending=isPend(kind);
       return `<div class="panel stack pad ${kind}">${label}<p class="small muted" style="margin:0">Dicas de ${esc(nameOf(cur.teams[target].enc))}. ${kind==="dec"&&v.members[t].length>2||kind==="int"&&v.mode==="std"?"Sua equipe vê as mesmas escolhas em tempo real: combinem e alguém envia.":"Escolha um número diferente para cada dica."}</p>
-        ${clues.map((c,i)=>`<div class="pline"><span class="slip ${target}">${esc(c)}</span><span class="nums" role="group" aria-label="Número da dica ${i+1}">${[1,2,3,4].map(n=>`<button class="num ${d[i]===n?"sel":""}" data-a="pick" data-k="${kind}" data-i="${i}" data-n="${n}" aria-pressed="${d[i]===n}">${n}</button>`).join("")}</span></div>`).join("")}
-        <button class="btn ${kind==="int"?"red":"cyan"}" data-a="submit" data-k="${kind}" ${isCode(d)?"":"disabled"}>${kind==="int"?"Interceptar":"Decifrar"}</button></div>`;
+        ${clues.map((c,i)=>`<div class="pline"><span class="slip ${target}">${esc(c)}</span><span class="nums" role="group" aria-label="Número da dica ${i+1}">${[1,2,3,4].map(n=>`<button class="num ${d[i]===n?"sel":""}" ${sending?"disabled":""} data-a="pick" data-k="${kind}" data-i="${i}" data-n="${n}" aria-pressed="${d[i]===n}">${n}</button>`).join("")}</span></div>`).join("")}
+        <button class="btn ${kind==="int"?"red":"cyan"}" data-a="submit" data-k="${kind}" ${isCode(d)&&!sending?"":"disabled"}>${sending?`<span class="spin"></span> Enviando…`:(kind==="int"?"Interceptar":"Decifrar")}</button></div>`;
     };
     if(t){
       const mine=cur.teams[t];
@@ -1073,6 +1112,22 @@ function actionArea(){
   return "";
 }
 
+function transmissionOutcome(t, x, n){
+  const v=VIEW, solo=v.mode==="3p", opp=other(t), needInt=n>=v.interceptFrom;
+  const intOk=needInt && x.intOk, decOk=x.decOk;
+  const T=esc(teamName(t)), O=esc(teamName(opp));
+  const ev=[];
+  if(intOk) ev.push(solo?`+1 ficha para o ${O} (interceptou)`:`+1 interceptação para a ${O}`);
+  if(!decOk) ev.push(solo?`+1 ficha para o ${O} (falha de comunicação ${soloTx().da})`:`+1 falha de comunicação para a ${T}`);
+  let winner, head;
+  if(!needInt && decOk){ winner=t; head=`Código recebido pela ${solo?soloTx().a.slice(2):T} (não há interceptação na 1ª rodada)`; }
+  else if(!intOk && decOk){ winner=t; head=`Ponto para ${solo?soloTx().a:"a "+T}: código entregue sem ser interceptado`; }
+  else if(intOk && decOk){ winner=opp; head=`Ponto para ${solo?"o "+O:"a "+O}: interceptou o código`; }
+  else if(intOk && !decOk){ winner=opp; head=`Ponto para ${solo?"o "+O:"a "+O}: interceptou, e ${solo?soloTx().a:"a "+T} ainda errou o próprio código`; }
+  else { winner=opp; head= solo ? `Ponto para o ${O}: ${soloTx().a} errou o próprio código` : `Ponto contra a ${T}: errou o próprio código`; }
+  return {winner, head, ev};
+}
+
 function revealView(){
   const v=VIEW, r=v.history[v.history.length-1]; if(!r) return "";
   const cards=Object.keys(r.teams).map(t=>{
@@ -1080,9 +1135,9 @@ function revealView(){
     const intLine = r.n>=v.interceptFrom
       ? `<span>Interceptação</span><span><span class="term">${x.int?x.int.join(""):"—"}</span> ${x.intOk?`<span class="stamp badst">Interceptado!</span>`:`<span class="stamp good">Protegido</span>`}</span>`
       : `<span>Interceptação</span><span style="opacity:.6">não vale na 1ª rodada</span>`;
-    return `<div class="rcard ${t}"><h3>${esc(teamName(t))}</h3><p class="small" style="margin:2px 0 10px;opacity:.75">Codificador: ${esc(nameOf(x.enc))}</p>
-      <div class="row" style="flex-wrap:nowrap;gap:14px;align-items:flex-start">${floppy(t,x.code,"CÓDIGO REAL","flip")}<div class="stack" style="flex:1">${x.clues.map((c,i)=>`<div class="slip ${t}"><b style="color:var(--red)">${x.code[i]}</b> ${esc(c)}</div>`).join("")}</div></div>
-      <div class="res"><span>Decifração</span><span><span class="term">${x.dec?x.dec.join(""):"—"}</span> ${x.decOk?`<span class="stamp good">Recebido</span>`:`<span class="stamp badst">Falha!</span>`}</span>${intLine}</div></div>`;
+    return `<div class="rcard ${t}"><h3>${esc(teamName(t))}</h3><p class="small" style="margin:2px 0 10px;opacity:.75">Codificador: ${esc(nameOf(x.enc))}${x.swaps&&x.swaps.length?`<br>Trocas nesta rodada: ${x.swaps.map(w=>`${esc(nameOf(w.from))} → ${esc(nameOf(w.to))} (código ${w.code.join("")} descartado)`).join("; ")}`:""}</p>
+      <div class="row" style="flex-wrap:nowrap;gap:14px;align-items:flex-start">${floppy(t,x.code,"CÓDIGO REAL",once("flip-"+v.gameNo+"-"+r.n+"-"+t+"-"+v.me,"flip"))}<div class="stack" style="flex:1">${x.clues.map((c,i)=>`<div class="slip ${t}"><b style="color:var(--red)">${x.code[i]}</b> ${esc(c)}</div>`).join("")}</div></div>
+      <div class="res"><span>Decifração</span><span><span class="term">${x.dec?x.dec.join(""):"—"}</span> ${x.decOk?`<span class="stamp good">Recebido</span>`:`<span class="stamp badst">Falha!</span>`}</span>${intLine}</div>${(()=>{ const o=transmissionOutcome(t,x,r.n); return `<div class="verdict ${o.winner===t?"win":"lose"}"><b>${o.winner===t?"✔":"✖"} ${o.head}</b>${o.ev.length?`<span>${o.ev.join(" · ")}</span>`:`<span>Nenhuma ficha nesta transmissão.</span>`}</div>`; })()}</div>`;
   }).join("");
   let msg="Todos prontos? Qualquer jogador pode avançar.", btn="Próxima rodada";
   if(v.result){ btn = v.result.why==="tiebreak" ? "Ir para o desempate" : "Ver resultado"; msg = v.result.why==="tiebreak" ? "Empate! As equipes vão tentar adivinhar as palavras adversárias." : "A partida acabou!"; }
@@ -1095,7 +1150,7 @@ function tiebreakView(){
   if(v.tb.mine) return `<div class="stack">${statusLine(true,"Sua equipe já enviou os palpites.")}${statusLine(v.tb.sent[other(t)], v.tb.sent[other(t)]?"A outra equipe também enviou.":"Esperando a outra equipe…")}</div>`;
   return `<div class="panel stack"><span class="tasklabel int">Desempate</span><h2>Quais são as palavras da ${esc(teamName(other(t)))}?</h2><p class="small muted" style="margin:0">Use o quadro de dicas. Acerta quem escrever exatamente a palavra (acentos e maiúsculas não importam). Combinem e alguém envia.</p>
     ${[0,1,2,3].map(i=>`<div class="clueform"><div class="line"><span class="numtag">${i+1}</span><input type="text" id="tb${i}" maxlength="30" autocomplete="off" value="${esc(UI.tbDraft[i])}"></div></div>`).join("")}
-    <button class="btn red" data-a="sendTb">Enviar palpites</button></div>`;
+    <button class="btn red" data-a="sendTb" ${isPend("tb")?"disabled":""}>${isPend("tb")?`<span class="spin"></span> Enviando…`:"Enviar palpites"}</button></div>`;
 }
 
 function sheet(){
@@ -1119,9 +1174,9 @@ function historyTable(){
   const v=VIEW; if(!v.history.length) return "";
   const rows=[];
   v.history.forEach(r=>Object.keys(r.teams).forEach(t=>{ const x=r.teams[t];
-    rows.push(`<tr><td>${r.n}</td><td>${esc(teamName(t))}</td><td>${esc(nameOf(x.enc))}</td><td>${x.clues.map(esc).join(" · ")}</td><td class="term">${x.code.join("")}</td><td class="term">${x.dec?x.dec.join(""):"—"} <span class="${x.decOk?"ok":"bad"}">${x.decOk?"✓":"✗"}</span></td><td class="term">${r.n>=v.interceptFrom&&x.int?x.int.join("")+` <span class="${x.intOk?"bad":"ok"}">${x.intOk?"!":"✓"}</span>`:"—"}</td></tr>`);
+    rows.push(`<tr><td>${r.n}</td><td>${esc(teamName(t))}</td><td>${esc(nameOf(x.enc))}</td><td>${x.clues.map(esc).join(" · ")}</td><td class="term">${x.code.join("")}</td><td class="term">${x.dec?x.dec.join(""):"—"} <span class="${x.decOk?"ok":"bad"}">${x.decOk?"✓":"✗"}</span></td><td class="term">${r.n>=v.interceptFrom&&x.int?x.int.join("")+` <span class="${x.intOk?"ok":"bad"}">${x.intOk?"✓":"✗"}</span>`:"—"}</td></tr>`);
   }));
-  return `<details class="panel tight"><summary style="cursor:pointer;font-family:var(--head)">Histórico de rodadas</summary><div class="tablewrap" style="margin-top:10px"><table><thead><tr><th>R</th><th>Equipe</th><th>Codificou</th><th>Dicas</th><th>Código</th><th>Decifrou</th><th>Interceptado</th></tr></thead><tbody>${rows.join("")}</tbody></table></div></details>`;
+  return `<details class="panel tight"><summary style="cursor:pointer;font-family:var(--head)">Histórico de rodadas</summary><div class="tablewrap" style="margin-top:10px"><table><thead><tr><th>R</th><th>Equipe</th><th>Codificou</th><th>Dicas</th><th>Código</th><th>Decifração</th><th>Interceptação</th></tr></thead><tbody>${rows.join("")}</tbody></table></div></details>`;
 }
 
 function gameView(){
@@ -1139,7 +1194,7 @@ function endView(){
   const mine = v.myTeam && res.winner===v.myTeam;
   const teams = v.mode==="3p" ? ["W"] : ["W","B"];
   return `<div class="stack">
-    <div class="panel stack" style="text-align:center"><div class="winner">${esc(title)}</div>${sub?`<p class="muted" style="margin:0">${esc(sub)}</p>`:""}${mine?`<p style="margin:0">🎉 Missão cumprida, agente.</p>`:""}</div>
+    <div class="panel stack" style="text-align:center"><div class="winner ${once("win-"+v.gameNo+"-"+v.me,"zoom")}">${esc(title)}</div>${sub?`<p class="muted" style="margin:0">${esc(sub)}</p>`:""}${mine?`<p style="margin:0">🎉 Missão cumprida, agente.</p>`:""}</div>
     <div class="reveal">${teams.map(t=>`<div class="screen ${t}"><div class="title"><h3>Palavras · ${esc(teamName(t))}</h3></div>${monitors(v.allWords[t],t,true)}${v.tb.all&&v.tb.all[other(t)]?`<p class="small" style="margin:10px 0 0">Palpites da ${esc(teamName(other(t)))}: ${v.tb.all[other(t)].map(esc).join(", ")}</p>`:""}</div>`).join("")}</div>
     <div class="row">${amHost()?`<button class="btn big" data-a="newgame">Jogar de novo</button><span class="small muted">Volta para a sala de espera, onde dá para trocar as equipes.</span>`:`<span class="muted">O anfitrião pode começar uma nova partida.</span>`}</div>
     ${sheet()}${historyTable()}
@@ -1190,16 +1245,24 @@ document.addEventListener("click", e=>{
     case "tab": UI.tab=b.dataset.t; UI.noteDraft={}; render(); break;
     case "sendClues": {
       const c=UI.clueDraft.v.map(x=>x.trim()); if(c.some(x=>!x)){ toast("Escreva as três dicas antes de transmitir."); return; }
-      send({t:"clues", clues:c}); break;
+      if(isPend("clues")) return;
+      const myx=VIEW.current&&VIEW.myTeam&&VIEW.current.teams[VIEW.myTeam];
+      send({t:"clues", clues:c, code: myx&&myx.code}); markPend("clues","As dicas não foram confirmadas. Tente transmitir de novo."); break;
     }
     case "pick": {
-      const k=b.dataset.k, i=+b.dataset.i, n=+b.dataset.n; const d=(VIEW.drafts&&VIEW.drafts[k])||[];
-      send({t:"draft", kind:k, i, n: d[i]===n ? null : n}); break;
+      const k=b.dataset.k, i=+b.dataset.i, n=+b.dataset.n; if(isPend(k)) return;
+      const arr=dispDraft(k).slice(), val = arr[i]===n ? null : n;
+      if(val===null) arr[i]=null; else { for(let q=0;q<3;q++) if(arr[q]===val) arr[q]=null; arr[i]=val; }
+      UI.local[k]={arr, key:pk(k), until:Date.now()+2500};
+      send({t:"draft", kind:k, i, n:val}); render(); setTimeout(render, 2600); break;
     }
-    case "submit": send({t:"submit", kind:b.dataset.k}); break;
+    case "submit": {
+      const k=b.dataset.k; if(isPend(k)) return;
+      send({t:"submit", kind:k}); markPend(k,"O palpite não foi confirmado. Tente enviar de novo."); break;
+    }
     case "next": send({t:"next"}); break;
     case "skipEnc": if(ROLE==="lab"||confirm("Passar a vez para o próximo da equipe? Ele recebe um código novo.")) send({t:"skipEnc", team:b.dataset.t}); break;
-    case "sendTb": { const w=UI.tbDraft.map(x=>x.trim()); if(w.filter(Boolean).length<1){ toast("Escreva pelo menos um palpite."); return; } send({t:"tb", words:w}); break; }
+    case "sendTb": { const w=UI.tbDraft.map(x=>x.trim()); if(w.filter(Boolean).length<1){ toast("Escreva pelo menos um palpite."); return; } if(isPend("tb")) return; send({t:"tb", words:w}); markPend("tb","Os palpites não foram confirmados. Tente de novo."); break; }
     case "newgame": send({t:"newgame"}); break;
   }
 });
