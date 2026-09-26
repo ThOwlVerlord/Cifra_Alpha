@@ -335,7 +335,7 @@ function newState(code, hostPid, hostName){
   return {
     code, hostPid, gameNo:1, phase:"lobby", mode:null,
     players:{ [hostPid]:{name:hostName, team:null, online:true, joined:Date.now()} },
-    settings:{ timer:true, rounds3:5, custom:null },
+    settings:{ timer:false, rounds3:5, custom:null },
     deck:[], words:{W:null,B:null}, members:{W:[],B:[]},
     round:0, rounds:[], drafts:{}, timerEnd:null, tb:{W:null,B:null}, result:null, notes:{W:["","","",""],B:["","","",""]}
   };
